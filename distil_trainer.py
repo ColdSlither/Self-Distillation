@@ -108,7 +108,16 @@ class MemoryEfficientSyncRefModelCallback(TrainerCallback):
 
     @staticmethod
     def _sync_param(model_param, ref_param, alpha):
-        """Sync a single parameter: ref = alpha * model + (1 - alpha) * ref"""
+        """Sync a single parameter: ref = alpha * model + (1 - alpha) * ref.
+
+        Shape guard: when the student uses LoRA/PEFT adapters it carries extra
+        parameters (e.g. lora_A/B) that the reference (teacher) model does not have.
+        Skip those — only parameters present in BOTH models with matching shapes are
+        synced. Without this guard the callback raises
+        `RuntimeError: The size of tensor a (1024) must match the size of tensor b (16)`.
+        """
+        if model_param.shape != ref_param.shape:
+            return
         ref_param.data.mul_(1.0 - alpha).add_(model_param.data, alpha=alpha)
 
     @staticmethod

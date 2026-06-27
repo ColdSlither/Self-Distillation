@@ -1,118 +1,116 @@
-# Why Training Kept Failing — Root Cause & The Exit
+# SDFT — Root Cause Across Both Walls (v2)
 
-> Read this BEFORE touching any Spheron instance. Every claim below was verified
-> against the repo source and the known-good local `venv/` on 2026-06-26.
-
-## TL;DR (the one-paragraph version)
-
-The training loop was caused by **installing the wrong library versions** on every
-Spheron instance, then applying per-instance patches for the symptoms of those wrong
-versions. Five of the six cataloged "patches" are fixes for bugs that **only exist with
-the wrong vllm/transformers**. The repo's own `requirements.txt` already contains a
-known-good version set, and a working `venv/` exists locally proving those versions
-import cleanly. The "2-GPU + server mode + NCCL" line of attack in the handoff chases a
-problem that **does not exist in colocate mode** — and colocate is what the repo ships by
-default. We are abandoning server mode permanently.
+> Two distinct walls were hit. Both are now diagnosed. This doc is the single source
+> of truth. Read it before touching any instance.
+> **Current solution:** branch `spheron-h100`, `use_vllm=False` path.
 
 ---
 
-## Verified version matrix (from `venv/` — known good)
+## Wall 1 (solved) — The version/server-mode trap
 
-| Package     | Handoff/scripts said | Repo `requirements.txt` | LOCAL VENV (proven) |
-|-------------|----------------------|-------------------------|---------------------|
-| torch       | 2.5.1                | 2.9.0                   | **2.9.0+cu128**     |
-| vllm        | 0.10.2               | 0.12.0                  | **0.12.0**          |
-| trl         | 0.24.0               | 0.24.0                  | **0.24.0**          |
-| transformers| (unpinned → 5.x)     | 4.57.1                  | **4.57.1**          |
-| accelerate  | 1.2.1                | 1.11.0                  | **1.11.0**          |
-| peft        | 0.14.0               | 0.17.1                  | **0.17.1**          |
-| datasets    | 3.2.0                | 4.3.0                   | **4.3.0**           |
+The first ~15 hours of failure came from **installing the wrong library versions on every
+Spheron instance, then patching the symptoms.** Five of six cataloged "patches" were fixes
+for bugs that only exist with wrong vllm/transformers. The repo's own `requirements.txt` is
+a known-good matrix, and a local `venv/` proves it imports cleanly.
 
-`venv/bin/python -c "import trl, vllm, transformers, torch"` → **IMPORT OK**.
-This is the target state for every Spheron instance.
+The "2-GPU + server mode + NCCL" attack chased a problem **that does not exist in colocate
+mode** — colocate is the repo default and never calls `init_communicator`.
 
-### The known mismatch (be aware, don't "fix" it)
+### Verified version matrix (from `venv/` — known good)
 
-TRL 0.24 emits an advisory warning at import:
-> "TRL currently only supports vLLM version 0.10.2. You have version 0.12.0 installed."
+| Package | Wrong (handoff) | Repo `requirements.txt` | Proven in venv |
+|---------|-----------------|-------------------------|----------------|
+| torch | 2.5.1 | 2.9.0 | **2.9.0+cu128** |
+| vllm | 0.10.2 | 0.12.0 | **0.12.0** |
+| trl | 0.24.0 | 0.24.0 | **0.24.0** |
+| transformers | (→5.x) | 4.57.1 | **4.57.1** |
 
-This is **baked into the upstream repo** — its own `requirements.txt` pins vllm 0.12.0 while
-TRL 0.24 nominally wants 0.10.2. It is the seed of the entire debugging loop: every prior
-attempt "fixed" the warning by pinning vllm 0.10.2, which then *actually broke* things
-(`truncate_prompt_tokens`, `vllm_ascend` import, tokenizer API) — which then got "patched"
-one by one. **Do not pin vllm 0.10.2.** The 0.12.0 + 0.24.0 combo imports cleanly,
-instantiates `DistilConfig`/`DistilTrainer` cleanly, and the installed `vllm_client.py`
-already supports the 0.12 API surface. The warning is advisory and harmless. Treat it as
-expected output, not an error.
+TRL 0.24 warns it "only supports vllm 0.10.2" — **ignore it.** Pinning 0.10.2 is what
+*caused* the `truncate_prompt_tokens`/`vllm_ascend`/tokenizer breakage. 0.12.0 works.
 
-## The six "patches" — verdict on each
+### Patch verdicts
 
-| # | Patch                    | Verdict     | Why                                                                 |
-|---|--------------------------|-------------|---------------------------------------------------------------------|
-| 1 | transformers==4.57.1     | **REAL**    | transformers 5.x removed `all_special_tokens_extended`. Repo already pins 4.57.1 in `requirements.txt`. **Fix = install the repo's requirements, not add a patch.** |
-| 2 | vllm_ascend import guard | **NOT NEEDED** | The installed `trl/extras/vllm_client.py:37-42` already guards it correctly inside `if is_vllm_ascend_available():`. The bug only appears with the wrong vllm. |
-| 3 | warnings_issued guard    | **NOT NEEDED** | Verified `hasattr(model, "warnings_issued")` → True on real Qwen2.5 with transformers 4.57.1. The crash only happens on transformers 5.x. |
-| 4 | gpu_memory_utilization   | context-only | Real tuning, but only painful at the 47 GB knife-edge. On 80 GB (H100) the default is comfortable. |
-| 5 | init_communicator dance  | **AVOID ENTIRELY** | Only exists in `vllm_mode="server"`. Colocate mode (`distil_trainer.py:461-513`) never calls it. The whole Instance-4 saga is server-mode-only. |
-| 6 | report_to="none"         | REAL (minor) | Keep `report_to="none"` and `WANDB_MODE=disabled`. |
-| (extra) | truncate_prompt_tokens removal | **HARMFUL — DO NOT** | The installed `vllm_client.py:185,254` **supports** `truncate_prompt_tokens`. The trainer relies on it (`distil_trainer.py:1109,1142`). The old `setup_spheron.sh` patch that removes it breaks truncation. Remove that patch. |
+| Patch | Verdict |
+|-------|---------|
+| transformers==4.57.1 | REAL — but repo already pins it. Install repo reqs. |
+| vllm_ascend guard | NOT NEEDED — installed source already guards it |
+| warnings_issued guard | NOT NEEDED — transformers 4.57.1 provides the attr |
+| init_communicator/NCCL/2-GPU | AVOID — colocate never calls it |
+| truncate_prompt_tokens removal | HARMFUL — installed client supports it, trainer uses it |
+| report_to="none" | REAL (minor) — kept |
 
-## Why server mode is the trap
+---
 
-`distil_trainer.py` has two branches:
+## Wall 2 (solved) — The 80 GB OOM at compute_loss
 
-- **`vllm_mode="server"`** (lines 452-459): launches a *separate* vLLM process (2nd model
-  copy, ~16 GB), requires `VLLMClient`, `init_communicator()`, NCCL broadcast for weight
-  sync (`update_named_param`). This is where every hang / HTTP 500 / OOM came from.
-- **`vllm_mode="colocate"`** (lines 461-513): vLLM runs **in-process**. One model copy.
-  Weight sync is a direct `llm_model.load_weights(...)` call — no NCCL, no HTTP, no second
-  GPU. This is the repo default and the only mode we will use.
+After the version/server-mode trap was cleared, the H100 run hit a **genuinely different,
+structural wall.** The signature: an OOM at `torch.cat(all_logps)` in `_get_per_token_logps_and_entropies`
+(`distil_trainer.py:814`) with a fingerprint **identical every run (78.24 GB / 964 MB free)
+regardless of batch size, `vllm_gpu_memory_utilization`, sleep mode, or teacher precision.**
 
-The handoff's own Session-2 post-mortem (`2026-06-26-session2.md`) states:
-> "I changed vllm_mode='colocate' to 'server'. This was the WRONG fix."
+When *nothing* moves memory, it's not tuning — it's a structural floor.
 
-…then the handoff's "EXACT FIX" section prescribes server mode anyway. **That
-contradiction is the loop.** We resolve it: **colocate only, single GPU, forever.**
+### The mechanism (verified against code)
 
-## Memory reality for Qwen3-8B (why the card matters)
+1. **vLLM colocate pre-allocates its full KV cache at init (~24 GB) and ignores
+   `vllm_gpu_memory_utilization` in colocate mode.** That's why turning the knob did nothing.
+2. Resident set at the moment of OOM: vLLM weights ~15 GB + vLLM KV ~24 GB + student ~16 GB +
+   teacher ~6-16 GB + CUDA ~5 GB = **~66-76 GB locked.**
+3. The forward-KL loss (`distil_trainer.py:1659`) materializes a **full-vocabulary
+   log-softmax** over Qwen3's 151,936 vocab for every completion token, for **both** student
+   and teacher simultaneously: `[B, completion_len, 151936]`. At batch 2 / 1024 tokens that's
+   ~1.24 GB/model in fp32, ~3-5 GB peak transient total (incl. `kl_div`).
+4. With only 964 MB free, the `torch.cat` that assembles these needs ~1 GB more → **OOM by
+   ~200 MB, every time.**
 
-LoRA + colocate on one card (teacher is the SDFT ref model — it is load-bearing and stays):
+### Why every "not tried" option except use_vllm=False was a dead end
 
-| Component                       | VRAM    |
-|---------------------------------|---------|
-| Student base, frozen bf16        | ~16 GB  |
-| Teacher (ref), forward-only bf16 | ~16 GB  |
-| vLLM colocate (weights + KV)     | ~16-22 GB |
-| LoRA params + AdamW (small)      | ~1-2 GB |
-| Activations (grad ckpt on)       | ~4-8 GB |
-| **Total**                        | **~50-60 GB** |
+| Option | Verdict |
+|--------|---------|
+| student device_map="auto" | Dead — PCIe offload of the loss forward, 10-50× slower |
+| PYTORCH_ALLOC_CONF (non-CUDA) | Dead — out of *total* memory, not fragmentation |
+| sleep(level=0) | Weak — frees vLLM weights but reload every step kills throughput |
+| generate_from_teacher=True | Dead — teacher is 4-bit, vLLM wants bf16; doesn't touch OOM tensor |
+| **use_vllm=False** | **FIX** — drops ~39 GB (vLLM weights + KV). HF `model.generate()` instead. |
+| H200 141GB | Also a fix — but costs ~2x; use_vllm=False keeps the $2/hr H100 |
+| reduce max_completion_length | Partial — halves the OOM tensor; helps, doesn't fully solve 80 GB |
 
-- **A6000 47 GB**: ~1-10 GB short → OOM at a *different* point each run → looks like
-  "I just need a bigger setting." This is the false signal that drove the 2-GPU idea.
-- **H100 80 GB (~$2/hr on Spheron)**: ~20-30 GB headroom. Comfortable. This is the card
-  the repo was designed for (README: "All experiments can be run with a single H200").
+**The fix chosen:** `use_vllm=False`. It's the repo author's own escape hatch — the
+non-vLLM generation path (`distil_trainer.py:1236-1270`) is a complete first-class branch,
+not a stub. Generation is slower (HF vs vLLM), but a full training step completes.
 
-**We are not fighting 47 GB anymore. Rent the H100.**
+---
 
-## The exit (what this branch implements)
+## What's committed on `spheron-h100`
 
-1. `requirements.txt` (repo) is the source of truth — install it verbatim.
-2. `main_lora.py` — LoRA config (`peft_config`), `vllm_mode="colocate"`, single GPU, no
-   teacher offload needed on 80 GB, `report_to="none"`.
-3. `setup_spheron_h100.sh` — idempotent, installs repo requirements (no version drift),
-   downloads Qwen3-8B, writes the launch script. **No source patching** — the repo source
-   is correct as-shipped.
-4. `smoke_test.sh` — ~10 examples, 3 steps, <5 min, ~$0.20. Proves the whole pipeline
-   (init → generate → backward → checkpoint) before any full paid run.
-5. `train.sh` — full run launcher with the right env vars.
+1. **`distil_trainer.py`** — `_sync_param` shape guard. With LoRA, the student has adapter
+   params the teacher lacks; the ref-sync callback crashes on shape mismatch without this.
+   (Postmortem found this as "Blocker 1"; it was never committed before — now it is, so it
+   never needs re-patching.)
+2. **`main_lora.py`** — `use_vllm=False`, LoRA, teacher kept (load-bearing), `report_to="none"`,
+   `gradient_checkpointing=True`, `--smoke_test` mode, `--max_completion_length` (default 512)
+   to keep the former-OOM tensor small even as insurance.
+3. **`setup_spheron_h100.sh`** — idempotent; installs repo reqs verbatim + bitsandbytes;
+   verifies the version matrix; generates `train.sh` + `smoke_test.sh` with NO
+   `expandable_segments` (postmortem blocker #2: incompatible with the memory pool) and NO
+   NCCL env (no server mode).
 
-## If it still fails: the verification loop
+---
 
-Run, read the **full** error, classify:
+## Path forward
+
+1. **H100 80GB on Spheron** (~$2/hr).
+2. `git clone -b spheron-h100 … && bash setup_spheron_h100.sh`
+3. `bash ~/smoke_test.sh` — proves init → HF generate → compute_loss (former OOM site) →
+   checkpoint. If this passes, the wall is broken.
+4. `bash ~/train.sh` — full run, only after smoke passes.
+5. **Snapshot the instance** after setup.
+
+## If it still fails
+
+- *OOM again at compute_loss* → lower `--max_completion_length` (256) or batch. The tensor
+  scales linearly with completion length.
+- *Shape mismatch in sync* → the guard is in place; if it still fires, the LoRA target modules
+  diverge from teacher — check `target_modules`.
 - *Import/AttributeError* → version drift. Diff `pip freeze` against the matrix above.
-- *OOM at generation* → lower `vllm_gpu_memory_utilization` (0.5 → 0.4).
-- *OOM at backward* → enable `gradient_checkpointing=True` (already on), lower batch.
-- *Hang* → you're in server mode. Switch to colocate.
-
-**Do not add new one-off patches.** If a fix is needed, it goes in the repo on this branch
-and is committed, so the next instance inherits it automatically. That is how the loop ends.
+- *Hang* → impossible under `use_vllm=False` (no NCCL). If it hangs, something re-enabled vLLM.
