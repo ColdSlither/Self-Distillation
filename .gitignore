@@ -6,3 +6,9 @@ wandb/
 results/
 bsub_outputs/
 .hyperparameter_search_scripts_main/
+
+# local reference venv (huge; rebuilt from requirements.txt on each instance)
+venv/
+
+# local model downloads
+Qwen3-8B/
