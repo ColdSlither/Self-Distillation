@@ -134,12 +134,17 @@ class MemoryEfficientSyncRefModelCallback(TrainerCallback):
         are synced; adapter-only and modules_to_save params are skipped.
         """
         def _norm(name: str) -> str:
-            # Strip HF/PEFT internal prefixes so student base params line up with the teacher.
+            # Strip HF/PEFT/DDP internal prefixes so student base params line up with the teacher.
             # PEFT wraps the original Linear in `base_layer`, so e.g.
             #   student:  base_model.model.model.layers.0.self_attn.q_proj.base_layer.weight
             #   teacher:               model.layers.0.self_attn.q_proj.weight
-            # must normalize to the same key.
+            # must normalize to the same key. Under DDP, Accelerate also wraps the student in
+            # DistributedDataParallel which prepends `module.`, so e.g.
+            #   student:  module.base_model.model.model.layers.0.self_attn.q_proj.base_layer.weight
+            # must normalize to the same key as the teacher. Without stripping `module.` the
+            # name match silently no-ops and the teacher never tracks the student (DDP bug).
             for prefix in (
+                "module.",
                 "base_model.model.",
                 "_checkpoint_wrapped_module.",
                 "modules_to_save.default.",
