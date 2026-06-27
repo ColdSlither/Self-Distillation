@@ -124,30 +124,60 @@ class MemoryEfficientSyncRefModelCallback(TrainerCallback):
     def sync_target_model_memory_efficient(model, target_model, alpha):
         """
         Sync target_model to track model, gathering one parameter at a time.
-        
         This is O(1) in memory overhead instead of O(N) where N is model size.
+
+        Name-based matching (required for LoRA/PEFT): positional zip() breaks when
+        the student carries adapter params the teacher lacks — it misaligns every
+        parameter after the first adapter, silently syncing the wrong tensors or
+        skipping base weights. We match by normalized parameter NAME instead, so
+        only base-model parameters present in BOTH models (with matching shapes)
+        are synced; adapter-only and modules_to_save params are skipped.
         """
+        def _norm(name: str) -> str:
+            # Strip HF/PEFT internal prefixes so student base params line up with the teacher.
+            # PEFT wraps the original Linear in `base_layer`, so e.g.
+            #   student:  base_model.model.model.layers.0.self_attn.q_proj.base_layer.weight
+            #   teacher:               model.layers.0.self_attn.q_proj.weight
+            # must normalize to the same key.
+            for prefix in (
+                "base_model.model.",
+                "_checkpoint_wrapped_module.",
+                "modules_to_save.default.",
+            ):
+                name = name.replace(prefix, "")
+            name = name.replace(".base_layer", "")
+            return name
+
+        def _is_adapter(name: str) -> bool:
+            return ("lora_" in name) or ("modules_to_save" in name) or ("original_module" in name)
+
+        target_by_name = {_norm(n): p for n, p in target_model.named_parameters()}
+
         deepspeed_plugin = AcceleratorState().deepspeed_plugin
         is_zero3 = deepspeed_plugin is not None and deepspeed_plugin.zero_stage == 3
-        
+
         if is_zero3:
             import deepspeed
-            
-            # Iterate through parameters one at a time
-            for (name, model_param), (_, ref_param) in zip(
-                model.named_parameters(), target_model.named_parameters()
-            ):
-                # Gather only this pair of parameters
-                with deepspeed.zero.GatheredParameters(
-                    [model_param, ref_param], modifier_rank=0
-                ):
+
+            for name, model_param in model.named_parameters():
+                if _is_adapter(name):
+                    continue
+                ref_name = _norm(name)
+                ref_param = target_by_name.get(ref_name)
+                if ref_param is None or ref_param.shape != model_param.shape:
+                    continue
+                with deepspeed.zero.GatheredParameters([model_param, ref_param], modifier_rank=0):
                     if deepspeed.comm.get_rank() == 0:
-                        MemoryEfficientSyncRefModelCallback._sync_param(
-                            model_param, ref_param, alpha
-                        )
+                        MemoryEfficientSyncRefModelCallback._sync_param(model_param, ref_param, alpha)
         else:
-            # Non-ZeRO-3: just iterate normally
-            for model_param, ref_param in zip(model.parameters(), target_model.parameters()):
+            # Non-ZeRO-3: match by name (positional zip is unsafe under LoRA).
+            for name, model_param in model.named_parameters():
+                if _is_adapter(name):
+                    continue
+                ref_name = _norm(name)
+                ref_param = target_by_name.get(ref_name)
+                if ref_param is None or ref_param.shape != model_param.shape:
+                    continue
                 MemoryEfficientSyncRefModelCallback._sync_param(model_param, ref_param, alpha)
 
     def on_step_end(self, args, state, control, **kwargs):
